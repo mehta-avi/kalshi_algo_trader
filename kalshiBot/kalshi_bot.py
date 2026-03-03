@@ -35,7 +35,9 @@ import time
 import uuid
 import base64
 import json
+import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional, List, Dict
 from collections import deque
 
@@ -64,6 +66,7 @@ LIVE_BASE_URL   = "https://api.elections.kalshi.com"
 SERIES_TICKER   = "KXBTC15M"
 BASELINE_VOL    = 0.015   # BTC vol the random-walk model is calibrated against
 DEFAULT_BALANCE = 10_000.0
+LOG_FILE        = "trades.txt"   # All trades and final summary written here
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +151,7 @@ class KalshiBTC15MinBot:
         private_key_path: str,
         demo_mode: bool = True,
         min_edge: float = 0.08,
-        max_drawdown_pct: float = 0.10,
+        max_drawdown_pct: float = 0.15,
     ):
         self.demo_mode         = demo_mode
         self.min_edge          = min_edge
@@ -189,6 +192,18 @@ class KalshiBTC15MinBot:
         # Re-hydrate open positions after a restart (live only)
         if not demo_mode:
             self._restore_open_positions()
+
+        # Trade log file — one file per session, timestamped
+        session_ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._log_path = Path(LOG_FILE).with_stem(f"trades_{session_ts}")
+        self._log_path.touch()
+        # Ensure file is UTF-8 from the start
+        open(self._log_path, "w", encoding="utf-8").close()
+        self._log(f"{'=' * 70}")
+        self._log(f"  Kalshi BTC 15-Min Bot  —  Session started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._log(f"  Mode: {'DEMO' if demo_mode else 'LIVE'}  |  Min edge: {min_edge:.1%}  |  Max drawdown: {max_drawdown_pct:.1%}")
+        self._log(f"  Starting balance: ${self.initial_portfolio:,.2f}")
+        self._log(f"{'=' * 70}\n")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Initialisation helpers
@@ -251,6 +266,86 @@ class KalshiBTC15MinBot:
 
         except Exception as e:
             print(f"  Warning: could not restore positions ({e})")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Trade logging
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _log(self, text: str):
+        """Append a line to the trade log file and mirror it to stdout."""
+        print(text)
+        with open(self._log_path, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+    def _log_trade(self, trade: dict):
+        """
+        Write a single completed trade as a structured log entry.
+        Called immediately after every settlement so no trade is ever lost
+        even if the bot crashes before final summary.
+        """
+        sep = "─" * 70
+        won = trade["won"]
+        self._log(sep)
+        self._log(f"  {'✅ WIN' if won else '❌ LOSS'}  |  {trade['ticker']}  |  {trade['side'].upper()}")
+        self._log(f"  Time      : {trade['entry_time']}  →  {trade['close_time']}")
+        self._log(f"  BTC       : ${trade.get('start_btc', 0):,.2f}  →  ${trade.get('final_btc', trade.get('entry_btc', 0)):,.2f}")
+        self._log(f"  Contracts : {trade.get('quantity', 1)}  @  ${trade['entry_price']:.2f}  (cost ${trade['cost']:.2f})")
+        self._log(f"  Payout    : ${trade['payout']:.2f}  |  Profit: ${trade['profit']:+.2f}  ({trade['roi']:+.1f}%)")
+        self._log(f"  Edge      : {trade.get('signal', {}).get('edge', 0):.1%}"
+                  f"  |  Fair: {trade.get('signal', {}).get('fair_prob', 0):.1%}"
+                  f"  |  Market: {trade.get('signal', {}).get('market_prob', 0):.1%}")
+        self._log(sep)
+
+    def _log_final_summary(self):
+        """Write the full session summary to the log file."""
+        open_value = sum(p["cost"] for p in self.positions.values())
+        total      = self.portfolio_value + open_value
+        pnl        = total - self.initial_portfolio
+        n          = len(self.closed_trades)
+
+        lines = []
+        lines.append("\n" + "=" * 70)
+        lines.append("  📊  FINAL SESSION SUMMARY")
+        lines.append(f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("=" * 70)
+        lines.append(f"  Starting balance : ${self.initial_portfolio:,.2f}")
+        lines.append(f"  Cash             : ${self.portfolio_value:,.2f}")
+        if self.positions:
+            lines.append(f"  Open positions   : ${open_value:,.2f}  ({len(self.positions)} positions)")
+        lines.append(f"  Total value      : ${total:,.2f}")
+        lines.append(f"  P&L              : ${pnl:+,.2f}  ({pnl/self.initial_portfolio:+.2%})")
+        lines.append(f"  Peak portfolio   : ${self.peak_portfolio:,.2f}")
+        lines.append(f"  Max drawdown     : {(self.peak_portfolio - total) / self.peak_portfolio:.1%}")
+
+        if n > 0:
+            wins   = [t for t in self.closed_trades if t["won"]]
+            losses = [t for t in self.closed_trades if not t["won"]]
+            avg_win    = sum(t["profit"] for t in wins)   / len(wins)   if wins   else 0
+            avg_loss   = sum(t["profit"] for t in losses) / len(losses) if losses else 0
+            avg_profit = sum(t["profit"] for t in self.closed_trades) / n
+            pf         = abs(avg_win / avg_loss) if avg_loss < 0 else float("inf")
+            total_profit = sum(t["profit"] for t in self.closed_trades)
+
+            lines.append(f"\n  Closed trades  : {n}")
+            lines.append(f"  Win rate       : {len(wins)/n:.1%}  ({len(wins)}W / {len(losses)}L)")
+            lines.append(f"  Total profit   : ${total_profit:+.2f}")
+            lines.append(f"  Avg profit     : ${avg_profit:+.2f} per trade")
+            lines.append(f"  Avg win        : ${avg_win:+.2f}  |  Avg loss: ${avg_loss:+.2f}")
+            lines.append(f"  Profit factor  : {pf:.2f}")
+
+            # Running equity curve (cumulative P&L per trade)
+            lines.append("\n  Equity curve (cumulative P&L per trade):")
+            cumulative = 0.0
+            for i, t in enumerate(self.closed_trades, 1):
+                cumulative += t["profit"]
+                bar = ("█" * int(abs(cumulative) / max(abs(pnl), 0.01) * 20)).ljust(20)
+                sign = "+" if cumulative >= 0 else "-"
+                lines.append(f"    #{i:>3}  {t['ticker'][-12:]}  {sign}${abs(cumulative):.2f}  |{bar}|")
+
+        lines.append("=" * 70)
+
+        for line in lines:
+            self._log(line)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Risk controls
@@ -318,7 +413,7 @@ class KalshiBTC15MinBot:
            vol_shrink = clamp(BASELINE_VOL / current_vol, 0.25, 1.0)
         """
         n = len(self.closed_trades)
-        sample_conf  = max(0.20, 1.0 - 1.0 / (1.0 + n / 20.0))
+        sample_conf  = max(0.50, 1.0 - 1.0 / (1.0 + n / 50.0))
         vol_shrink   = max(0.25, min(1.0, BASELINE_VOL / max(volatility, BASELINE_VOL)))
         adjusted     = base_kelly * sample_conf * vol_shrink
 
@@ -647,7 +742,7 @@ class KalshiBTC15MinBot:
 
                     self.portfolio_value += payout
                     now = datetime.now(timezone.utc)
-                    self.closed_trades.append({
+                    closed = {
                         "ticker":       ticker,
                         "side":         pos["side"],
                         "entry_price":  pos["entry_price"],
@@ -656,18 +751,16 @@ class KalshiBTC15MinBot:
                         "profit":       profit,
                         "roi":          roi,
                         "won":          won,
+                        "quantity":     pos["quantity"],
                         "start_btc":    start_price,
                         "final_btc":    current_price,
                         "entry_time":   pos["entry_time"],
                         "close_time":   now.isoformat(),
                         "duration_min": (now - datetime.fromisoformat(pos["entry_time"])).total_seconds() / 60,
-                    })
-
-                    print(f"\n{'=' * 70}")
-                    print(f"  [DEMO] {'🎉 WIN' if won else '❌ LOSS'}: {ticker}")
-                    print(f"  BTC: ${start_price:,.2f} → ${current_price:,.2f}  |  Profit: ${profit:+.2f} ({roi:+.1f}%)")
-                    print(f"  Portfolio: ${self.portfolio_value:,.2f}")
-                    print(f"{'=' * 70}\n")
+                        "signal":       pos.get("signal", {}),
+                    }
+                    self.closed_trades.append(closed)
+                    self._log_trade(closed)
 
                 else:
                     closed = self._settle_from_kalshi(ticker, pos)
@@ -675,7 +768,10 @@ class KalshiBTC15MinBot:
                         print(f"  ⏳ {ticker}: Kalshi result not yet published — retrying next iteration")
                         continue
                     self.portfolio_value += closed["payout"]
+                    closed["quantity"] = pos.get("quantity", 1)
+                    closed["signal"]   = pos.get("signal", {})
                     self.closed_trades.append(closed)
+                    self._log_trade(closed)
 
                 to_close.append(ticker)
 
@@ -762,7 +858,7 @@ class KalshiBTC15MinBot:
         # Step 1 & 2: uncertainty-adjusted quarter-Kelly
         base_kelly = max(0.0, (2 * win_prob - 1) * 0.25)
         adj_kelly  = self._uncertainty_adjusted_kelly(base_kelly, signal["volatility"])
-        size_pct   = min(adj_kelly, 0.02)   # hard cap: 2% per trade
+        size_pct   = min(adj_kelly, 0.05)   # hard cap: 2% per trade
 
         if size_pct < 0.005:
             print(f"  ✗ Position size too small after adjustment ({size_pct:.4f}) — skipping")
@@ -804,13 +900,14 @@ class KalshiBTC15MinBot:
                 return
 
         # Record position
+        entry_time = datetime.now(timezone.utc).isoformat()
         self.positions[ticker] = {
             "ticker":          ticker,
             "side":            side,
             "quantity":        quantity,
             "entry_price":     entry_px,
             "cost":            actual_cost,
-            "entry_time":      datetime.now(timezone.utc).isoformat(),
+            "entry_time":      entry_time,
             "signal":          signal,
             "market":          market,
             "start_btc_price": signal["start_price"],
@@ -818,6 +915,13 @@ class KalshiBTC15MinBot:
         }
         self.portfolio_value -= actual_cost
         self.trades_log.append(signal)
+
+        # Log entry to file
+        self._log(
+            f"  📥 ENTRY  {ticker}  {side.upper()} × {quantity}"
+            f"  @${entry_px:.2f}  cost=${actual_cost:.2f}"
+            f"  edge={signal['edge']:.1%}  [{entry_time}]"
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main loop
@@ -911,37 +1015,8 @@ class KalshiBTC15MinBot:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _print_final_summary(self):
-        """Print a detailed P&L summary on shutdown."""
-        open_value = sum(p["cost"] for p in self.positions.values())
-        total      = self.portfolio_value + open_value
-        pnl        = total - self.initial_portfolio
-
-        print("\n\n" + "=" * 70)
-        print("  📊  FINAL SUMMARY")
-        print("=" * 70)
-        print(f"  Starting balance : ${self.initial_portfolio:,.2f}")
-        print(f"  Cash             : ${self.portfolio_value:,.2f}")
-        if self.positions:
-            print(f"  Open positions   : ${open_value:,.2f}  ({len(self.positions)} positions)")
-        print(f"  Total value      : ${total:,.2f}")
-        print(f"  P&L              : ${pnl:+,.2f}  ({pnl/self.initial_portfolio:+.2%})")
-
-        n = len(self.closed_trades)
-        if n > 0:
-            wins        = [t for t in self.closed_trades if t["won"]]
-            losses      = [t for t in self.closed_trades if not t["won"]]
-            avg_win     = sum(t["profit"] for t in wins)   / len(wins)   if wins   else 0
-            avg_loss    = sum(t["profit"] for t in losses) / len(losses) if losses else 0
-            avg_profit  = sum(t["profit"] for t in self.closed_trades) / n
-            profit_factor = abs(avg_win / avg_loss) if avg_loss < 0 else float("inf")
-
-            print(f"\n  Closed trades  : {n}")
-            print(f"  Win rate       : {len(wins)/n:.1%}  ({len(wins)}W / {len(losses)}L)")
-            print(f"  Avg profit     : ${avg_profit:+.2f}")
-            print(f"  Avg win        : ${avg_win:+.2f}  |  Avg loss: ${avg_loss:+.2f}")
-            print(f"  Profit factor  : {profit_factor:.2f}")
-
-        print("=" * 70)
+        """Write full session summary to log file and print to console."""
+        self._log_final_summary()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -955,7 +1030,7 @@ def main():
     PRIVATE_KEY_PATH  = "kalshi_keys/bot_key.pem" # Path to RSA private key
     DEMO_MODE         = True                      # Set False for live trading
     MIN_EDGE          = 0.08                      # Minimum edge to trade (8%)
-    MAX_DRAWDOWN      = 0.10                      # Circuit breaker at 10% drawdown
+    MAX_DRAWDOWN      = 0.15                      # Circuit breaker at 10% drawdown
     CHECK_INTERVAL    = 10                        # Seconds between iterations
     # ─────────────────────────────────────────────────────────────────────────
 
